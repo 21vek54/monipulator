@@ -1,6 +1,6 @@
 ﻿#include <Arduino.h>
 
-constexpr char FW_VERSION[] = "v1.5.1";
+constexpr char FW_VERSION[] = "v1.5.2";
 
 constexpr uint8_t PIN_STEP_PUL = 13; // DM542 PUL
 constexpr uint8_t PIN_STEP_DIR = 12; // DM542 DIR
@@ -85,6 +85,7 @@ uint32_t g_bcBatchResultsSteps[BC_BATCH_PLATES_MAX] = {};
 bool g_c3Active = false;
 C3State g_c3State = C3State::Idle;
 bool g_c3FirstLeaveCaptured = false;
+bool g_c3SilentMode = false;
 uint32_t g_c3CenterStartStep = 0;
 uint32_t g_c3FirstFlagDownStep = 0;
 uint32_t g_c3FirstLeaveStep = 0;
@@ -101,6 +102,7 @@ void printHelp()
     Serial.println("  A 200        - влево, 200 мм (задержка 2000 мкс)");
     Serial.println("  BC 2         - тест N тарелок: для каждой +20 мм, замер после опускания флага, в конце таблица и среднее");
     Serial.println("  3            - рабочий цикл: 2 тарелки с UT и таймингами 80/185/115 мм");
+    Serial.println("  4            - рабочий цикл как 3, но без вывода сообщений в монитор");
     Serial.println("  W            - флаг вверх");
     Serial.println("  S            - флаг вниз");
     Serial.println("  E            - вкл/выкл поток датчика (каждые 0.5 сек)");
@@ -260,7 +262,7 @@ void startBCTest(uint8_t platesCount)
     startBCPlateCycle();
 }
 
-void startCycle3()
+void startCycle3(bool silentMode)
 {
     if (g_motion.active || g_bcBatchActive || g_c3Active) {
         Serial.println("C3: ошибка, двигатель уже в движении.");
@@ -284,6 +286,7 @@ void startCycle3()
     g_motion.lastPulseStartUs = micros();
 
     g_c3Active = true;
+    g_c3SilentMode = silentMode;
     g_c3State = C3State::SeekFirstPlate;
     g_c3FirstLeaveCaptured = false;
     g_c3CenterStartStep = g_totalStepsCounter;
@@ -293,8 +296,29 @@ void startCycle3()
     g_c3FinalStartStep = g_totalStepsCounter;
     g_c3UTSteps = 0;
 
-    Serial.println("C3: старт рабочего цикла.");
-    Serial.println("C3: шаги 1-3: флаги вверх, конвейер вправо, поиск первой тарелки.");
+    if (!g_c3SilentMode) {
+        Serial.println("C3: старт рабочего цикла.");
+        Serial.println("C3: шаги 1-3: флаги вверх, конвейер вправо, поиск первой тарелки.");
+    }
+}
+
+void captureC3FirstLeaveIfNeeded()
+{
+    if (g_c3FirstLeaveCaptured || isPlateAtSensorFiltered()) {
+        return;
+    }
+
+    g_c3FirstLeaveCaptured = true;
+    g_c3FirstLeaveStep = g_totalStepsCounter;
+    g_c3UTSteps = g_totalStepsCounter - g_c3FirstFlagDownStep;
+
+    if (!g_c3SilentMode) {
+        Serial.print("C3: первая тарелка ушла с датчика, UT=");
+        Serial.print(g_c3UTSteps);
+        Serial.print(" шагов (");
+        Serial.print(static_cast<float>(g_c3UTSteps) / static_cast<float>(PULSES_PER_MM), 1);
+        Serial.println(" мм).");
+    }
 }
 
 void processCycle3()
@@ -306,7 +330,10 @@ void processCycle3()
     if (!g_motion.active) {
         g_c3Active = false;
         g_c3State = C3State::Idle;
-        Serial.println("C3: сценарий прерван (двигатель остановлен вне C3).");
+        if (!g_c3SilentMode) {
+            Serial.println("C3: сценарий прерван (двигатель остановлен вне C3).");
+        }
+        g_c3SilentMode = false;
         return;
     }
 
@@ -315,7 +342,9 @@ void processCycle3()
             if (isPlateAtSensorFiltered()) {
                 g_c3CenterStartStep = g_totalStepsCounter;
                 g_c3State = C3State::CenterFirstPlate;
-                Serial.println("C3: первая тарелка найдена, центрирование +20 мм.");
+                if (!g_c3SilentMode) {
+                    Serial.println("C3: первая тарелка найдена, центрирование +20 мм.");
+                }
             }
             return;
 
@@ -326,77 +355,49 @@ void processCycle3()
                 g_c3FirstLeaveCaptured = false;
                 g_c3UTSteps = 0;
                 g_c3State = C3State::TrackFirstLeaveAndOpen;
-                Serial.println("C3: флаги опущены, измеряем UT и ждем +80 мм до подъема флагов.");
+                if (!g_c3SilentMode) {
+                    Serial.println("C3: флаги опущены, измеряем UT и ждем +80 мм до подъема флагов.");
+                }
             }
             return;
 
         case C3State::TrackFirstLeaveAndOpen:
-            if (!g_c3FirstLeaveCaptured && !isPlateAtSensorFiltered()) {
-                g_c3FirstLeaveCaptured = true;
-                g_c3FirstLeaveStep = g_totalStepsCounter;
-                g_c3UTSteps = g_totalStepsCounter - g_c3FirstFlagDownStep;
-                Serial.print("C3: первая тарелка ушла с датчика, UT=");
-                Serial.print(g_c3UTSteps);
-                Serial.print(" шагов (");
-                Serial.print(static_cast<float>(g_c3UTSteps) / static_cast<float>(PULSES_PER_MM), 1);
-                Serial.println(" мм).");
-            }
+            captureC3FirstLeaveIfNeeded();
 
             if ((uint32_t)(g_totalStepsCounter - g_c3FirstFlagDownStep) >= C3_FLAG_REOPEN_STEPS) {
                 digitalWrite(PIN_FLAG, FLAG_UP_LEVEL);
                 g_c3State = C3State::SeekSecondPlate;
-                Serial.println("C3: +80 мм после первого опускания, флаги подняты. Поиск второй тарелки.");
+                if (!g_c3SilentMode) {
+                    Serial.println("C3: +80 мм после первого опускания, флаги подняты. Поиск второй тарелки.");
+                }
             }
             return;
 
         case C3State::SeekSecondPlate:
-            if (!g_c3FirstLeaveCaptured && !isPlateAtSensorFiltered()) {
-                g_c3FirstLeaveCaptured = true;
-                g_c3FirstLeaveStep = g_totalStepsCounter;
-                g_c3UTSteps = g_totalStepsCounter - g_c3FirstFlagDownStep;
-                Serial.print("C3: первая тарелка ушла с датчика, UT=");
-                Serial.print(g_c3UTSteps);
-                Serial.print(" шагов (");
-                Serial.print(static_cast<float>(g_c3UTSteps) / static_cast<float>(PULSES_PER_MM), 1);
-                Serial.println(" мм).");
-            }
+            captureC3FirstLeaveIfNeeded();
 
             if (isPlateAtSensorFiltered()) {
                 g_c3CenterStartStep = g_totalStepsCounter;
                 g_c3State = C3State::CenterSecondPlate;
-                Serial.println("C3: вторая тарелка найдена, центрирование +20 мм.");
+                if (!g_c3SilentMode) {
+                    Serial.println("C3: вторая тарелка найдена, центрирование +20 мм.");
+                }
             }
             return;
 
         case C3State::CenterSecondPlate:
-            if (!g_c3FirstLeaveCaptured && !isPlateAtSensorFiltered()) {
-                g_c3FirstLeaveCaptured = true;
-                g_c3FirstLeaveStep = g_totalStepsCounter;
-                g_c3UTSteps = g_totalStepsCounter - g_c3FirstFlagDownStep;
-                Serial.print("C3: первая тарелка ушла с датчика, UT=");
-                Serial.print(g_c3UTSteps);
-                Serial.print(" шагов (");
-                Serial.print(static_cast<float>(g_c3UTSteps) / static_cast<float>(PULSES_PER_MM), 1);
-                Serial.println(" мм).");
-            }
+            captureC3FirstLeaveIfNeeded();
 
             if ((uint32_t)(g_totalStepsCounter - g_c3CenterStartStep) >= C3_CENTER_STEPS) {
                 g_c3State = C3State::WaitSecondFlagDownTiming;
-                Serial.println("C3: вторая тарелка центрирована, ожидаем тайминг 185 мм от ухода первой.");
+                if (!g_c3SilentMode) {
+                    Serial.println("C3: вторая тарелка центрирована, ожидаем тайминг 185 мм от ухода первой.");
+                }
             }
             return;
 
         case C3State::WaitSecondFlagDownTiming:
-            if (!g_c3FirstLeaveCaptured && !isPlateAtSensorFiltered()) {
-                g_c3FirstLeaveCaptured = true;
-                g_c3FirstLeaveStep = g_totalStepsCounter;
-                g_c3UTSteps = g_totalStepsCounter - g_c3FirstFlagDownStep;
-                Serial.print("C3: первая тарелка ушла с датчика, UT=");
-                Serial.print(g_c3UTSteps);
-                Serial.print(" шагов (");
-                Serial.print(static_cast<float>(g_c3UTSteps) / static_cast<float>(PULSES_PER_MM), 1);
-                Serial.println(" мм).");
-            }
+            captureC3FirstLeaveIfNeeded();
 
             if (!g_c3FirstLeaveCaptured) {
                 return;
@@ -406,7 +407,9 @@ void processCycle3()
                 digitalWrite(PIN_FLAG, FLAG_DOWN_LEVEL);
                 g_c3SecondFlagDownStep = g_totalStepsCounter;
                 g_c3State = C3State::MoveAfterSecondFlagDown;
-                Serial.println("C3: выдержан тайминг 185 мм, флаги опущены.");
+                if (!g_c3SilentMode) {
+                    Serial.println("C3: выдержан тайминг 185 мм, флаги опущены.");
+                }
             }
             return;
 
@@ -414,7 +417,9 @@ void processCycle3()
             if ((uint32_t)(g_totalStepsCounter - g_c3SecondFlagDownStep) >= C3_FLAG_REOPEN_STEPS) {
                 digitalWrite(PIN_FLAG, FLAG_UP_LEVEL);
                 g_c3State = C3State::WaitSecondLeave;
-                Serial.println("C3: после второго опускания пройдено 80 мм, флаги подняты. Ждем уход второй тарелки.");
+                if (!g_c3SilentMode) {
+                    Serial.println("C3: после второго опускания пройдено 80 мм, флаги подняты. Ждем уход второй тарелки.");
+                }
             }
             return;
 
@@ -422,7 +427,9 @@ void processCycle3()
             if (!isPlateAtSensorFiltered()) {
                 g_c3FinalStartStep = g_totalStepsCounter;
                 g_c3State = C3State::FinalMoveAfterSecondLeave;
-                Serial.println("C3: вторая тарелка ушла с датчика, финальный добег 115 мм.");
+                if (!g_c3SilentMode) {
+                    Serial.println("C3: вторая тарелка ушла с датчика, финальный добег 115 мм.");
+                }
             }
             return;
 
@@ -431,11 +438,14 @@ void processCycle3()
                 stopMotion();
                 g_c3Active = false;
                 g_c3State = C3State::Idle;
-                Serial.print("C3: цикл завершен. UT=");
-                Serial.print(g_c3UTSteps);
-                Serial.print(" шагов (");
-                Serial.print(static_cast<float>(g_c3UTSteps) / static_cast<float>(PULSES_PER_MM), 1);
-                Serial.println(" мм).");
+                if (!g_c3SilentMode) {
+                    Serial.print("C3: цикл завершен. UT=");
+                    Serial.print(g_c3UTSteps);
+                    Serial.print(" шагов (");
+                    Serial.print(static_cast<float>(g_c3UTSteps) / static_cast<float>(PULSES_PER_MM), 1);
+                    Serial.println(" мм).");
+                }
+                g_c3SilentMode = false;
             }
             return;
 
@@ -629,7 +639,12 @@ void handleCommand(String line)
     }
 
     if (cmd == "3") {
-        startCycle3();
+        startCycle3(false);
+        return;
+    }
+
+    if (cmd == "4") {
+        startCycle3(true);
         return;
     }
 
