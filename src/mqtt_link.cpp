@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <PubSubClient.h>
 #include <WiFi.h>
+#include <limits.h>
 
 namespace MqttLink {
 
@@ -17,6 +18,9 @@ WiFiClient g_wifiClient;
 PubSubClient g_mqtt(g_wifiClient);
 uint32_t g_lastReconnectAttemptMs = 0;
 uint32_t g_lastHeartbeatMs = 0;
+uint32_t g_lastConnectFailMs = 0;
+int32_t g_lastConnectFailState = INT32_MIN;
+uint32_t g_connectFailCount = 0;
 String g_clientId;
 CommandHandler g_commandHandler = nullptr;
 
@@ -104,8 +108,9 @@ bool connectIfNeeded()
         return true;
     }
 
-    Serial.print("MQTT: connect failed, state=");
-    Serial.println(g_mqtt.state());
+    g_lastConnectFailState = g_mqtt.state();
+    g_lastConnectFailMs = nowMs;
+    g_connectFailCount++;
     return false;
 }
 
@@ -118,6 +123,46 @@ void begin()
     Serial.print(MQTT_BROKER_HOST);
     Serial.print(":");
     Serial.println(MQTT_BROKER_PORT);
+}
+
+void printStatus()
+{
+    const bool connected = g_mqtt.connected();
+    Serial.print("MQTT status: ");
+    Serial.println(connected ? "CONNECTED" : "DISCONNECTED");
+    Serial.print("  Broker: ");
+    Serial.print(MQTT_BROKER_HOST);
+    Serial.print(":");
+    Serial.println(MQTT_BROKER_PORT);
+    Serial.print("  Client ID: ");
+    Serial.println(g_clientId);
+    Serial.print("  PubSubClient state: ");
+    Serial.println(g_mqtt.state());
+
+    if (g_connectFailCount == 0) {
+        Serial.println("  Last connect fail: none");
+    } else {
+        Serial.print("  Last connect fail state: ");
+        Serial.println(g_lastConnectFailState);
+        Serial.print("  Connect fail count: ");
+        Serial.println(g_connectFailCount);
+        Serial.print("  Last fail age: ");
+        Serial.print(millis() - g_lastConnectFailMs);
+        Serial.println(" ms");
+    }
+
+    if (!connected && WiFi.status() == WL_CONNECTED) {
+        const uint32_t nowMs = millis();
+        uint32_t waitMs = 0;
+        const uint32_t elapsedMs = nowMs - g_lastReconnectAttemptMs;
+        if (elapsedMs < MQTT_RECONNECT_INTERVAL_MS) {
+            waitMs = MQTT_RECONNECT_INTERVAL_MS - elapsedMs;
+        }
+
+        Serial.print("  Next reconnect in: ");
+        Serial.print(waitMs);
+        Serial.println(" ms");
+    }
 }
 
 void process()

@@ -70,6 +70,13 @@ void printStatus()
     Serial.print("WiFi status: ");
     Serial.println(status == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
 
+    Serial.print("  Connect pending: ");
+    Serial.println(g_state.connectPending ? "YES" : "NO");
+    if (g_state.connectPending && !g_state.targetSsid.isEmpty()) {
+        Serial.print("  Target SSID: ");
+        Serial.println(g_state.targetSsid);
+    }
+
     if (status == WL_CONNECTED) {
         Serial.print("  SSID: ");
         Serial.println(WiFi.SSID());
@@ -187,10 +194,10 @@ void process()
 
 void printHelp()
 {
-    Serial.println("  WSCAN        - СЃРєР°РЅ WiFi-СЃРµС‚РµР№ РІРѕРєСЂСѓРі");
-    Serial.println("  WIFI ssid [pass] - РїРѕРґРєР»СЋС‡РёС‚СЊ ESP32 Рє WiFi");
-    Serial.println("  WSTAT        - СЃС‚Р°С‚СѓСЃ WiFi (SSID/IP/RSSI)");
-    Serial.println("  WDIS         - РѕС‚РєР»СЋС‡РёС‚СЊ WiFi");
+    Serial.println("  WSCAN        - скан WiFi-сетей вокруг");
+    Serial.println("  WIFI ssid [pass] - подключить ESP32 к WiFi");
+    Serial.println("  WSTAT        - статус WiFi (SSID/IP/RSSI)");
+    Serial.println("  WDIS         - отключить WiFi");
 }
 
 bool handleCommand(const String &cmd, const String &args, bool machineBusy)
