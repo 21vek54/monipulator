@@ -1,11 +1,16 @@
 ﻿#include <Arduino.h>
+#include <Preferences.h>
 
 #include "wifi_console.h"
 #include "mqtt_link.h"
 
-constexpr char FW_VERSION[] = "v1.7";
+constexpr char FW_VERSION[] = "v1.9";
 
 constexpr uint8_t PIN_STEP_PUL = 13; // DM542 PUL
+constexpr uint8_t PIN_SHIFT_DIR = 14; // Сдвиг тарелки DIR
+constexpr uint8_t PIN_SHIFT_PUL = 12; // Сдвиг тарелки PUL
+constexpr uint8_t PIN_SHIFT_SENSOR_Z = 33; // Геркон края Z (HIGH при магните)
+constexpr uint8_t PIN_SHIFT_SENSOR_C = 25; // Геркон края C (HIGH при магните)
 constexpr uint8_t PIN_FLAG = 27;     // Пневмоцилиндр флага
 constexpr uint8_t PIN_SENSOR = 26;   // E18-D50NK (активный HIGH)
 constexpr uint8_t PIN_POS_PUL = 32;  // EVA25 PUL
@@ -13,9 +18,25 @@ constexpr uint8_t PIN_POS_PUL = 32;  // EVA25 PUL
 constexpr bool FLAG_UP_LEVEL = HIGH;
 constexpr bool FLAG_DOWN_LEVEL = LOW;
 constexpr bool PULSE_ACTIVE_LEVEL = HIGH;
+constexpr bool SHIFT_DIR_C_LEVEL = HIGH;
+constexpr bool SHIFT_DIR_Z_LEVEL = LOW;
 
 constexpr uint32_t STEP_PULSE_WIDTH_US = 10;
 constexpr uint32_t POS_RUN_DELAY_US = 1000;
+constexpr uint32_t SHIFT_COMMAND_STEPS = 500; // Фиксированный ход C/Z до привязки или без поиска концевика
+constexpr uint32_t SHIFT_COMMAND_DELAY_C_US = 300; // Полка скорости команды C
+constexpr uint32_t SHIFT_COMMAND_DELAY_Z_US = 50; // Полка скорости команды Z: меньше значение = быстрее возврат
+constexpr uint32_t SHIFT_PULSE_WIDTH_US = 120; // Длительность STEP-импульса для привода сдвига
+constexpr uint32_t SHIFT_START_DELAY_C_US = 3000; // Стартовая задержка для плавного разгона команды C
+constexpr uint32_t SHIFT_START_DELAY_Z_US = 1000; // Стартовая задержка для плавного разгона команды Z
+constexpr uint32_t SHIFT_RAMP_STEPS_C = 500; // Длина разгона команды C
+constexpr uint32_t SHIFT_RAMP_STEPS_Z = 180; // Длина разгона команды Z
+constexpr uint32_t SHIFT_DECEL_STEPS_C = 1000; // Длина торможения только для команды C
+constexpr uint32_t SHIFT_SENSOR_DEBOUNCE_MS = 25;
+constexpr uint32_t SHIFT_LEAVE_SENSOR_MAX_STEPS = 300;
+constexpr uint32_t SHIFT_CAL_SEARCH_MAX_STEPS = 12000;
+constexpr uint32_t SHIFT_CAL_MOVE_MARGIN_STEPS = 50; // Запас шагов сверх номинального хода при поиске края
+constexpr uint32_t SHIFT_TRAVEL_STEPS_FIXED = 2255; // Фиксированный ход между краями C и Z после старта
 constexpr uint32_t SENSOR_PRINT_INTERVAL_MS = 500;
 constexpr uint32_t SENSOR_DEBOUNCE_MS = 80;
 constexpr uint32_t MANUAL_MOVE_DELAY_US = 1500; // Фиксированная задержка для команд A/D
@@ -86,13 +107,53 @@ enum class C2State : uint8_t {
     FinalMove
 };
 
+enum class Program1State : uint8_t {
+    Idle,
+    StartBufferedPass1,
+    WaitFirstC2Done,
+    WaitSecondC2Done,
+    WaitThirdC2Done,
+    WaitFinalPositionalDone,
+    WaitBufferFillC2Done
+};
+
+enum class Program1MetricKind : uint8_t {
+    Cycle2,
+    ShiftC,
+    Pos3,
+    ShiftZ,
+    BufferFill
+};
+
+struct Program1Metric {
+    Program1MetricKind kind = Program1MetricKind::Cycle2;
+    uint8_t passIndex = 0;
+    uint32_t startMs = 0;
+    uint32_t durationMs = 0;
+    bool active = false;
+    bool finished = false;
+};
+
 String g_cmdBuffer;
+Preferences g_preferences;
 MotionState g_motion;
 PosMotionState g_posMotion;
 SensorFilterState g_sensorFilter;
+SensorFilterState g_shiftSensorZFilter;
+SensorFilterState g_shiftSensorCFilter;
 bool g_sensorStreamEnabled = false;
 uint32_t g_lastSensorPrintMs = 0;
 uint32_t g_totalStepsCounter = 0;
+bool g_shiftCalibrated = true;
+uint32_t g_shiftTravelSteps = SHIFT_TRAVEL_STEPS_FIXED;
+Program1State g_program1State = Program1State::Idle;
+uint32_t g_program1StartMs = 0;
+Program1Metric g_program1Metrics[12] = {};
+uint8_t g_program1MetricCount = 0;
+int8_t g_program1ActiveC2Metric = -1;
+int8_t g_program1ActivePosMetric = -1;
+bool g_program1BufferReady = false;
+bool g_program1StorageReady = false;
 
 bool g_c2Active = false;
 C2State g_c2State = C2State::Idle;
@@ -112,22 +173,36 @@ int32_t g_c2FinalSlopeNum = C2_FINAL_UT_SLOPE_NUM;
 int32_t g_c2FinalSlopeDen = C2_FINAL_UT_SLOPE_DEN;
 
 bool isPlateAtSensorFiltered();
+bool isShiftSensorZTriggered();
+bool isShiftSensorCTriggered();
 void stopMotion();
 void startCycle2();
+void startPositionalProfiledMotion(uint32_t stepsTotal, uint32_t nominalDelayUs);
+void startProgram1();
 void processPositionalMotion();
 void printIntegrationStatus();
+void processProgram1();
+void updateSensorFilter();
+void updateShiftSensorFilters();
+void homeShiftToZOnStartup();
+void initProgram1Storage();
+void setProgram1BufferReady(bool ready);
 
 void printHelp()
 {
     Serial.println("Команды:");
     Serial.println("  D 200        - вправо, 200 мм (задержка 1500 мкс)");
+    Serial.println("  1            - автоцикл: 2 -> C+(3+Z) -> 2 -> C+(3+Z) -> 2 -> C+Z");
     Serial.println("  2            - рабочий ход: 1-я тарелка в упоре, 2-я с зазором 34 мм");
     Serial.println("  3            - позиционный (PUL32): вправо 184 мм, профиль, полка 1200 мкс");
     Serial.println("  W            - флаг вверх");
     Serial.println("  S            - флаг вниз");
-    Serial.println("  E            - вкл/выкл поток датчика (каждые 0.5 сек)");
+    Serial.println("  E            - вкл/выкл поток датчиков (E18 + 2 геркона, каждые 0.5 сек)");
     Serial.println("  IQ           - состояние внешних систем (WiFi + MQTT)");
     Serial.println("  P 300        - позиционный (PUL32): вправо 300 мм, профиль, полка 1000 мкс");
+    Serial.println("  C            - сдвиг тарелки: 500 шагов (DIR14/PUL12), задержка 500 мкс, S-профиль, длинное торможение");
+    Serial.println("  Z            - возврат тарелки: 500 шагов (DIR14/PUL12), задержка 300 мкс, плавный ход");
+    Serial.println("  CZ           - калибровка хода сдвига по герконам Z=33 и C=25");
     WifiConsole::printHelp();
     Serial.println("  H            - помощь");
 }
@@ -159,6 +234,32 @@ bool parseUnsigned(const String &s, uint32_t &value)
     }
     value = acc;
     return true;
+}
+
+void updateDebouncedSensorFilter(
+    SensorFilterState &state,
+    bool rawState,
+    uint32_t debounceMs)
+{
+    const uint32_t nowMs = millis();
+
+    if (!state.initialized) {
+        state.initialized = true;
+        state.lastRawPlateDetected = rawState;
+        state.stablePlateDetected = rawState;
+        state.lastRawChangeMs = nowMs;
+        return;
+    }
+
+    if (rawState != state.lastRawPlateDetected) {
+        state.lastRawPlateDetected = rawState;
+        state.lastRawChangeMs = nowMs;
+    }
+
+    if (rawState != state.stablePlateDetected &&
+        (uint32_t)(nowMs - state.lastRawChangeMs) >= debounceMs) {
+        state.stablePlateDetected = rawState;
+    }
 }
 
 bool parseDistanceMmArgs(String args, const String &cmd, uint32_t &distanceMm)
@@ -306,6 +407,870 @@ void writePulseInactive()
 void writePosPulseInactive()
 {
     digitalWrite(PIN_POS_PUL, PULSE_ACTIVE_LEVEL ? LOW : HIGH);
+}
+
+void writeShiftPulseInactive()
+{
+    digitalWrite(PIN_SHIFT_PUL, PULSE_ACTIVE_LEVEL ? LOW : HIGH);
+}
+
+void serviceShiftBackground(bool allowPositionalOverlap)
+{
+    updateSensorFilter();
+    updateShiftSensorFilters();
+    if (allowPositionalOverlap) {
+        processPositionalMotion();
+    }
+}
+
+void delayShiftUs(uint32_t delayUs, bool allowPositionalOverlap)
+{
+    const uint32_t startUs = micros();
+    while ((uint32_t)(micros() - startUs) < delayUs) {
+        serviceShiftBackground(allowPositionalOverlap);
+    }
+}
+
+uint32_t getShiftNominalDelayUs(bool dirLevel)
+{
+    return dirLevel == SHIFT_DIR_Z_LEVEL ? SHIFT_COMMAND_DELAY_Z_US : SHIFT_COMMAND_DELAY_C_US;
+}
+
+uint32_t getShiftStartDelayUs(bool dirLevel)
+{
+    return dirLevel == SHIFT_DIR_Z_LEVEL ? SHIFT_START_DELAY_Z_US : SHIFT_START_DELAY_C_US;
+}
+
+uint32_t interpolateSmoothDelayUs(
+    uint32_t progressSteps,
+    uint32_t rampSteps,
+    uint32_t startDelayUs,
+    uint32_t nominalDelayUs)
+{
+    if (rampSteps == 0U || progressSteps >= rampSteps || startDelayUs <= nominalDelayUs) {
+        return nominalDelayUs;
+    }
+
+    const uint32_t delta = startDelayUs - nominalDelayUs;
+    constexpr uint32_t kScale = 4096U;
+
+    const uint64_t x = (static_cast<uint64_t>(progressSteps) * kScale) / rampSteps;
+    const uint64_t easeScaled =
+        ((3ULL * x * x * kScale) - (2ULL * x * x * x)) /
+        (static_cast<uint64_t>(kScale) * kScale);
+
+    const uint32_t dec = static_cast<uint32_t>(
+        (static_cast<uint64_t>(delta) * easeScaled) / kScale);
+    return startDelayUs - dec;
+}
+
+uint32_t getShiftStepDelayUs(bool dirLevel, uint32_t stepIndex, uint32_t totalPlannedSteps)
+{
+    const uint32_t nominalDelayUs = getShiftNominalDelayUs(dirLevel);
+    const uint32_t startDelayUs = getShiftStartDelayUs(dirLevel);
+    uint32_t rampSteps = (dirLevel == SHIFT_DIR_C_LEVEL) ? SHIFT_RAMP_STEPS_C : SHIFT_RAMP_STEPS_Z;
+    uint32_t decelRampSteps = (dirLevel == SHIFT_DIR_C_LEVEL) ? SHIFT_DECEL_STEPS_C : SHIFT_RAMP_STEPS_Z;
+    if (totalPlannedSteps != 0U) {
+        const uint32_t halfSteps = totalPlannedSteps / 2U;
+        if (halfSteps < rampSteps) {
+            rampSteps = halfSteps;
+        }
+        if (halfSteps < decelRampSteps) {
+            decelRampSteps = halfSteps;
+        }
+    }
+    if (rampSteps == 0U) {
+        rampSteps = 1U;
+    }
+    if (decelRampSteps == 0U) {
+        decelRampSteps = 1U;
+    }
+
+    uint32_t accelProgress = stepIndex;
+    if (accelProgress > rampSteps) {
+        accelProgress = rampSteps;
+    }
+
+    const bool useSCurve = (dirLevel == SHIFT_DIR_C_LEVEL);
+    uint32_t targetDelayUs = useSCurve
+                                 ? interpolateSmoothDelayUs(
+                                       accelProgress,
+                                       rampSteps,
+                                       startDelayUs,
+                                       nominalDelayUs)
+                                 : interpolateDelayUs(
+                                       accelProgress,
+                                       rampSteps,
+                                       startDelayUs,
+                                       nominalDelayUs);
+
+    if (totalPlannedSteps != 0U) {
+        uint32_t remainingSteps = 0U;
+        if (totalPlannedSteps > stepIndex) {
+            remainingSteps = totalPlannedSteps - stepIndex;
+        }
+
+        uint32_t decelProgress = remainingSteps;
+        if (decelProgress > decelRampSteps) {
+            decelProgress = decelRampSteps;
+        }
+
+        const uint32_t decelDelayUs = useSCurve
+                                          ? interpolateSmoothDelayUs(
+                                                decelProgress,
+                                                decelRampSteps,
+                                                startDelayUs,
+                                                nominalDelayUs)
+                                          : interpolateDelayUs(
+                                                decelProgress,
+                                                decelRampSteps,
+                                                startDelayUs,
+                                                nominalDelayUs);
+        if (decelDelayUs > targetDelayUs) {
+            targetDelayUs = decelDelayUs;
+        }
+    }
+
+    if (targetDelayUs < nominalDelayUs) {
+        targetDelayUs = nominalDelayUs;
+    }
+
+    return targetDelayUs;
+}
+
+bool isShiftTargetSensorTriggered(bool dirLevel)
+{
+    return dirLevel == SHIFT_DIR_Z_LEVEL ? isShiftSensorZTriggered() : isShiftSensorCTriggered();
+}
+
+bool isShiftOppositeSensorTriggered(bool dirLevel)
+{
+    return dirLevel == SHIFT_DIR_Z_LEVEL ? isShiftSensorCTriggered() : isShiftSensorZTriggered();
+}
+
+void prepareShiftMove(bool dirLevel)
+{
+    digitalWrite(PIN_SHIFT_DIR, dirLevel);
+    writeShiftPulseInactive();
+    delayMicroseconds(200);
+}
+
+void pulseShiftStep(bool dirLevel, bool allowPositionalOverlap, uint32_t stepIndex, uint32_t totalPlannedSteps)
+{
+    const uint32_t shiftDelayUs = getShiftStepDelayUs(dirLevel, stepIndex, totalPlannedSteps);
+    digitalWrite(PIN_SHIFT_PUL, PULSE_ACTIVE_LEVEL ? HIGH : LOW);
+    delayShiftUs(SHIFT_PULSE_WIDTH_US, allowPositionalOverlap);
+    writeShiftPulseInactive();
+    delayShiftUs(shiftDelayUs, allowPositionalOverlap);
+}
+
+bool shiftLeaveSensor(
+    bool dirLevel,
+    bool (*sensorFn)(),
+    uint32_t maxSteps,
+    uint32_t &stepsDone,
+    uint32_t &profileStepIndex,
+    uint32_t profileTotalSteps,
+    bool allowPositionalOverlap)
+{
+    stepsDone = 0;
+    if (!sensorFn()) {
+        return true;
+    }
+
+    prepareShiftMove(dirLevel);
+    for (uint32_t i = 0; i < maxSteps; i++) {
+        pulseShiftStep(dirLevel, allowPositionalOverlap, profileStepIndex, profileTotalSteps);
+        stepsDone++;
+        profileStepIndex++;
+        if (!sensorFn()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool shiftFindSensor(
+    bool dirLevel,
+    bool (*sensorFn)(),
+    uint32_t maxSteps,
+    uint32_t &stepsDone,
+    uint32_t &profileStepIndex,
+    uint32_t profileTotalSteps,
+    bool allowPositionalOverlap)
+{
+    stepsDone = 0;
+    prepareShiftMove(dirLevel);
+    for (uint32_t i = 0; i < maxSteps; i++) {
+        pulseShiftStep(dirLevel, allowPositionalOverlap, profileStepIndex, profileTotalSteps);
+        stepsDone++;
+        profileStepIndex++;
+        if (sensorFn()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+uint32_t getShiftLeaveLimitSteps()
+{
+    uint32_t leaveLimit = SHIFT_LEAVE_SENSOR_MAX_STEPS;
+    if (g_shiftCalibrated) {
+        const uint32_t calibratedLimit = g_shiftTravelSteps + SHIFT_CAL_MOVE_MARGIN_STEPS;
+        if (calibratedLimit > leaveLimit) {
+            leaveLimit = calibratedLimit;
+        }
+    }
+    return leaveLimit;
+}
+
+void calibrateShiftTravel()
+{
+    if (g_motion.active || g_c2Active || g_posMotion.active) {
+        Serial.println("SHIFT: отказ, другой двигатель уже в движении.");
+        return;
+    }
+
+    Serial.println("SHIFT: CZ калибровка старт.");
+
+    const bool zActive = isShiftSensorZTriggered();
+    const bool cActive = isShiftSensorCTriggered();
+    if (zActive && cActive) {
+        g_shiftCalibrated = false;
+        Serial.println("SHIFT: ошибка, одновременно сработали Z и C. Проверь герконы.");
+        return;
+    }
+
+    if (zActive) {
+        Serial.println("SHIFT: каретка уже на краю Z.");
+    } else {
+        if (cActive) {
+            uint32_t leaveCSteps = 0;
+            uint32_t leaveCProfileStep = 0;
+            if (!shiftLeaveSensor(
+                    SHIFT_DIR_Z_LEVEL,
+                    isShiftSensorCTriggered,
+                    getShiftLeaveLimitSteps(),
+                    leaveCSteps,
+                    leaveCProfileStep,
+                    getShiftLeaveLimitSteps(),
+                    false)) {
+                g_shiftCalibrated = false;
+                Serial.println("SHIFT: ошибка, не удалось уйти с края C.");
+                return;
+            }
+            Serial.println("SHIFT: ушли с края C, ищем Z.");
+        } else {
+            Serial.println("SHIFT: старт между краями, ищем край Z.");
+        }
+
+        uint32_t stepsToZ = 0;
+        uint32_t stepsToZProfile = 0;
+        if (!shiftFindSensor(
+                SHIFT_DIR_Z_LEVEL,
+                isShiftSensorZTriggered,
+                SHIFT_CAL_SEARCH_MAX_STEPS,
+                stepsToZ,
+                stepsToZProfile,
+                SHIFT_CAL_SEARCH_MAX_STEPS,
+                false)) {
+            g_shiftCalibrated = false;
+            Serial.println("SHIFT: ошибка, край Z не найден.");
+            return;
+        }
+    }
+
+    Serial.println("SHIFT: край Z найден.");
+
+    uint32_t leaveZSteps = 0;
+    uint32_t leaveZProfileStep = 0;
+    if (!shiftLeaveSensor(
+            SHIFT_DIR_C_LEVEL,
+            isShiftSensorZTriggered,
+            getShiftLeaveLimitSteps(),
+            leaveZSteps,
+            leaveZProfileStep,
+            getShiftLeaveLimitSteps(),
+            false)) {
+        g_shiftCalibrated = false;
+        Serial.println("SHIFT: ошибка, не удалось уйти с края Z.");
+        return;
+    }
+
+    uint32_t stepsToC = 0;
+    uint32_t stepsToCProfile = 0;
+    if (!shiftFindSensor(
+            SHIFT_DIR_C_LEVEL,
+            isShiftSensorCTriggered,
+            SHIFT_CAL_SEARCH_MAX_STEPS,
+            stepsToC,
+            stepsToCProfile,
+            SHIFT_CAL_SEARCH_MAX_STEPS,
+            false)) {
+        g_shiftCalibrated = false;
+        Serial.println("SHIFT: ошибка, край C не найден.");
+        return;
+    }
+
+    g_shiftTravelSteps = leaveZSteps + stepsToC;
+    if (g_shiftTravelSteps == 0) {
+        g_shiftCalibrated = false;
+        Serial.println("SHIFT: ошибка, ход получился 0 шагов.");
+        return;
+    }
+
+    g_shiftCalibrated = true;
+
+    Serial.println("SHIFT: край C найден.");
+    Serial.print("SHIFT: калибровка завершена. Ход=");
+    Serial.print(g_shiftTravelSteps);
+    Serial.println(" шагов.");
+    Serial.println("SHIFT: каретка сейчас в крайнем положении C.");
+}
+
+bool runShiftMoveInternal(bool dirLevel, const char *name, bool allowPositionalOverlap)
+{
+    if (g_motion.active || g_c2Active || (g_posMotion.active && !allowPositionalOverlap)) {
+        Serial.println("SHIFT: отказ, другой двигатель уже в движении.");
+        return false;
+    }
+
+    if (!g_shiftCalibrated) {
+        const uint32_t shiftNominalDelayUs = getShiftNominalDelayUs(dirLevel);
+        Serial.print("SHIFT: калибровки нет, ");
+        Serial.print(name);
+        Serial.print(" выполнится на фиксированные ");
+        Serial.print(SHIFT_COMMAND_STEPS);
+        Serial.println(" шагов.");
+
+        Serial.print("SHIFT: старт ");
+        Serial.print(name);
+        Serial.print(", шагов=");
+        Serial.print(SHIFT_COMMAND_STEPS);
+        Serial.print(", задержка=");
+        Serial.print(shiftNominalDelayUs);
+        Serial.println(" мкс.");
+
+        prepareShiftMove(dirLevel);
+        uint32_t profileStepIndex = 0;
+        for (uint32_t i = 0; i < SHIFT_COMMAND_STEPS; i++) {
+            pulseShiftStep(dirLevel, allowPositionalOverlap, profileStepIndex, SHIFT_COMMAND_STEPS);
+            profileStepIndex++;
+        }
+
+        Serial.print("SHIFT: выполнено ");
+        Serial.print(name);
+        Serial.print(", шагов=");
+        Serial.print(SHIFT_COMMAND_STEPS);
+        Serial.print(", задержка=");
+        Serial.print(shiftNominalDelayUs);
+        Serial.println(" мкс.");
+        return true;
+    }
+
+    const bool targetActive = isShiftTargetSensorTriggered(dirLevel);
+    const bool oppositeActive = isShiftOppositeSensorTriggered(dirLevel);
+    if (targetActive && oppositeActive) {
+        Serial.println("SHIFT: ошибка, одновременно сработали оба геркона.");
+        return false;
+    }
+    if (targetActive) {
+        Serial.print("SHIFT: ");
+        Serial.print(name);
+        Serial.println(" не требуется, каретка уже в нужном крайнем положении.");
+        return true;
+    }
+
+    const uint32_t maxSeekSteps = g_shiftTravelSteps + SHIFT_CAL_MOVE_MARGIN_STEPS;
+    const uint32_t shiftNominalDelayUs = getShiftNominalDelayUs(dirLevel);
+    uint32_t totalSteps = 0;
+
+    Serial.print("SHIFT: старт ");
+    Serial.print(name);
+    Serial.print(", откалиброванный ход=");
+    Serial.print(g_shiftTravelSteps);
+    Serial.print(" шагов, задержка=");
+    Serial.print(shiftNominalDelayUs);
+    Serial.println(" мкс.");
+
+    if (oppositeActive) {
+        uint32_t leaveSteps = 0;
+        const uint32_t leaveLimitSteps = getShiftLeaveLimitSteps();
+        uint32_t profileStepIndex = totalSteps;
+        if (!shiftLeaveSensor(dirLevel, dirLevel == SHIFT_DIR_Z_LEVEL ? isShiftSensorCTriggered : isShiftSensorZTriggered,
+                leaveLimitSteps, leaveSteps, profileStepIndex, maxSeekSteps, allowPositionalOverlap)) {
+            Serial.print("SHIFT: не удалось уйти с противоположного края. Лимит=");
+            Serial.print(leaveLimitSteps);
+            Serial.println(" шагов.");
+            return false;
+        }
+        totalSteps += leaveSteps;
+    }
+
+    uint32_t seekSteps = 0;
+    uint32_t profileStepIndex = totalSteps;
+    const bool reachedEdge = shiftFindSensor(
+        dirLevel,
+        dirLevel == SHIFT_DIR_Z_LEVEL ? isShiftSensorZTriggered : isShiftSensorCTriggered,
+        maxSeekSteps,
+        seekSteps,
+        profileStepIndex,
+        maxSeekSteps,
+        allowPositionalOverlap);
+    totalSteps += seekSteps;
+
+    if (reachedEdge) {
+        Serial.print("SHIFT: выполнено ");
+        Serial.print(name);
+        Serial.print(", дошли до края, шагов=");
+        Serial.print(totalSteps);
+        Serial.println(".");
+    } else {
+        Serial.print("SHIFT: край не найден, остановка по лимиту. Шагов=");
+        Serial.print(totalSteps);
+        Serial.print(", лимит=");
+        Serial.print(maxSeekSteps);
+        Serial.println(".");
+    }
+
+    return reachedEdge;
+}
+
+void runShiftMove(bool dirLevel, const char *name)
+{
+    (void)runShiftMoveInternal(dirLevel, name, false);
+}
+
+void resetProgram1Metrics()
+{
+    for (uint8_t i = 0; i < 12; i++) {
+        g_program1Metrics[i] = Program1Metric();
+    }
+    g_program1MetricCount = 0;
+    g_program1ActiveC2Metric = -1;
+    g_program1ActivePosMetric = -1;
+}
+
+void printProgram1MetricLabel(const Program1Metric &metric)
+{
+    switch (metric.kind) {
+        case Program1MetricKind::Cycle2:
+            Serial.print("2 #");
+            break;
+        case Program1MetricKind::ShiftC:
+            Serial.print("C #");
+            break;
+        case Program1MetricKind::Pos3:
+            Serial.print("3 #");
+            break;
+        case Program1MetricKind::ShiftZ:
+            Serial.print("Z #");
+            break;
+        case Program1MetricKind::BufferFill:
+            Serial.print("BUF #");
+            break;
+        default:
+            Serial.print("? #");
+            break;
+    }
+    Serial.print(metric.passIndex);
+}
+
+int8_t beginProgram1Metric(Program1MetricKind kind, uint8_t passIndex)
+{
+    if (g_program1MetricCount >= 12) {
+        Serial.println("P1: overflow metrics.");
+        return -1;
+    }
+
+    Program1Metric &metric = g_program1Metrics[g_program1MetricCount];
+    metric.kind = kind;
+    metric.passIndex = passIndex;
+    metric.startMs = millis();
+    metric.durationMs = 0;
+    metric.active = true;
+    metric.finished = false;
+
+    const int8_t metricId = static_cast<int8_t>(g_program1MetricCount);
+    g_program1MetricCount++;
+    return metricId;
+}
+
+void finishProgram1Metric(int8_t metricId)
+{
+    if (metricId < 0 || metricId >= static_cast<int8_t>(g_program1MetricCount)) {
+        return;
+    }
+
+    Program1Metric &metric = g_program1Metrics[metricId];
+    if (!metric.active || metric.finished) {
+        return;
+    }
+
+    metric.durationMs = millis() - metric.startMs;
+    metric.active = false;
+    metric.finished = true;
+}
+
+void updateProgram1AsyncMetrics()
+{
+    if (g_program1ActiveC2Metric >= 0 && !g_c2Active) {
+        finishProgram1Metric(g_program1ActiveC2Metric);
+        g_program1ActiveC2Metric = -1;
+    }
+
+    if (g_program1ActivePosMetric >= 0 && !g_posMotion.active) {
+        finishProgram1Metric(g_program1ActivePosMetric);
+        g_program1ActivePosMetric = -1;
+    }
+}
+
+void printProgram1Summary()
+{
+    uint32_t sum2Ms = 0;
+    uint32_t sumCMs = 0;
+    uint32_t sum3Ms = 0;
+    uint32_t sumZMs = 0;
+    uint32_t sumBufMs = 0;
+
+    Serial.println("P1: ===== Summary =====");
+    for (uint8_t i = 0; i < g_program1MetricCount; i++) {
+        const Program1Metric &metric = g_program1Metrics[i];
+        Serial.print("P1: ");
+        printProgram1MetricLabel(metric);
+        Serial.print(" | ");
+        if (!metric.finished) {
+            Serial.println("RUNNING");
+            continue;
+        }
+
+        Serial.print(metric.durationMs);
+        Serial.println(" мс");
+
+        switch (metric.kind) {
+            case Program1MetricKind::Cycle2:
+                sum2Ms += metric.durationMs;
+                break;
+            case Program1MetricKind::ShiftC:
+                sumCMs += metric.durationMs;
+                break;
+            case Program1MetricKind::Pos3:
+                sum3Ms += metric.durationMs;
+                break;
+            case Program1MetricKind::ShiftZ:
+                sumZMs += metric.durationMs;
+                break;
+            case Program1MetricKind::BufferFill:
+                sumBufMs += metric.durationMs;
+                break;
+            default:
+                break;
+        }
+    }
+
+    const uint32_t totalProgramMs = millis() - g_program1StartMs;
+    Serial.print("P1: SUM 2 | ");
+    Serial.print(sum2Ms);
+    Serial.println(" мс");
+    Serial.print("P1: SUM C | ");
+    Serial.print(sumCMs);
+    Serial.println(" мс");
+    Serial.print("P1: SUM 3 | ");
+    Serial.print(sum3Ms);
+    Serial.println(" мс");
+    Serial.print("P1: SUM Z | ");
+    Serial.print(sumZMs);
+    Serial.println(" мс");
+    Serial.print("P1: SUM BUF | ");
+    Serial.print(sumBufMs);
+    Serial.println(" мс");
+    Serial.print("P1: TOTAL | ");
+    Serial.print(totalProgramMs);
+    Serial.print(" мс (");
+    Serial.print(static_cast<float>(totalProgramMs) / 1000.0F, 1);
+    Serial.println(" с)");
+}
+
+void startProgram1Cycle2Metric(Program1MetricKind kind, uint8_t passIndex)
+{
+    const int8_t metricId = beginProgram1Metric(kind, passIndex);
+    startCycle2();
+    if (g_c2Active && metricId >= 0) {
+        g_program1ActiveC2Metric = metricId;
+    } else {
+        finishProgram1Metric(metricId);
+    }
+}
+
+void startProgram1Cycle2(uint8_t passIndex)
+{
+    startProgram1Cycle2Metric(Program1MetricKind::Cycle2, passIndex);
+}
+
+void startProgram1Pos3(uint8_t passIndex)
+{
+    if (g_posMotion.active) {
+        Serial.print("P1: 3 #");
+        Serial.print(passIndex);
+        Serial.println(" не запущена, позиционный мотор уже в движении.");
+        return;
+    }
+
+    const int8_t metricId = beginProgram1Metric(Program1MetricKind::Pos3, passIndex);
+    startPositionalProfiledMotion(C3_COMMAND_STEPS, C3_COMMAND_DELAY_US);
+    if (g_posMotion.active && metricId >= 0) {
+        g_program1ActivePosMetric = metricId;
+    } else {
+        finishProgram1Metric(metricId);
+    }
+}
+
+bool runProgram1ShiftStage(bool dirLevel, Program1MetricKind kind, uint8_t passIndex, const char *name)
+{
+    const int8_t metricId = beginProgram1Metric(kind, passIndex);
+    const bool ok = runShiftMoveInternal(dirLevel, name, true);
+    finishProgram1Metric(metricId);
+    return ok;
+}
+
+void initProgram1Storage()
+{
+    g_program1StorageReady = g_preferences.begin("p1buf", false);
+    if (!g_program1StorageReady) {
+        Serial.println("P1: EEPROM storage unavailable, buffer flag reset.");
+        g_program1BufferReady = false;
+        return;
+    }
+
+    g_program1BufferReady = g_preferences.getBool("ready", false);
+}
+
+void setProgram1BufferReady(bool ready)
+{
+    g_program1BufferReady = ready;
+    if (!g_program1StorageReady) {
+        return;
+    }
+    g_preferences.putBool("ready", ready);
+}
+
+void homeShiftToZOnStartup()
+{
+    if (g_motion.active || g_c2Active || g_posMotion.active) {
+        Serial.println("SHIFT: стартовая привязка пропущена, система занята.");
+        return;
+    }
+
+    g_shiftCalibrated = true;
+    g_shiftTravelSteps = SHIFT_TRAVEL_STEPS_FIXED;
+
+    const bool zActive = isShiftSensorZTriggered();
+    const bool cActive = isShiftSensorCTriggered();
+    if (zActive && cActive) {
+        Serial.println("SHIFT: стартовая привязка невозможна, одновременно активны Z и C.");
+        return;
+    }
+
+    const uint32_t homeLimitSteps = getShiftLeaveLimitSteps();
+
+    if (zActive) {
+        Serial.println("SHIFT: стартовая привязка, каретка уже на Z. Отходим и заново ловим Z.");
+
+        uint32_t leaveSteps = 0;
+        uint32_t leaveProfileStep = 0;
+        if (!shiftLeaveSensor(
+                SHIFT_DIR_C_LEVEL,
+                isShiftSensorZTriggered,
+                homeLimitSteps,
+                leaveSteps,
+                leaveProfileStep,
+                homeLimitSteps,
+                false)) {
+            Serial.println("SHIFT: ошибка стартовой привязки, не удалось уйти с Z.");
+            return;
+        }
+    } else {
+        Serial.println("SHIFT: стартовая привязка, идем к Z.");
+    }
+
+    uint32_t seekSteps = 0;
+    uint32_t seekProfileStep = 0;
+    if (!shiftFindSensor(
+            SHIFT_DIR_Z_LEVEL,
+            isShiftSensorZTriggered,
+            homeLimitSteps,
+            seekSteps,
+            seekProfileStep,
+            homeLimitSteps,
+            false)) {
+        Serial.println("SHIFT: ошибка стартовой привязки, Z не найден.");
+        return;
+    }
+
+    Serial.print("SHIFT: стартовая привязка завершена. Z найден, ход=");
+    Serial.print(g_shiftTravelSteps);
+    Serial.println(" шагов.");
+}
+
+void startProgram1()
+{
+    if (g_program1State != Program1State::Idle) {
+        Serial.println("P1: программа 1 уже выполняется.");
+        return;
+    }
+
+    if (!g_shiftCalibrated) {
+        Serial.println("P1: сначала выполни CZ, чтобы откалибровать сдвиг.");
+        return;
+    }
+
+    if (g_motion.active || g_c2Active || g_posMotion.active) {
+        Serial.println("P1: отказ, система уже выполняет движение.");
+        return;
+    }
+
+    Serial.println("P1: старт программы 1.");
+    g_program1StartMs = millis();
+    resetProgram1Metrics();
+
+    if (g_program1BufferReady) {
+        Serial.println("P1: буфер с 2 тарелками найден, начинаем сразу с C #1.");
+        setProgram1BufferReady(false);
+        g_program1State = Program1State::StartBufferedPass1;
+        return;
+    }
+
+    Serial.println("P1: шаг 1/3 -> команда 2.");
+    startProgram1Cycle2(1);
+    g_program1State = Program1State::WaitFirstC2Done;
+}
+
+void processProgram1()
+{
+    updateProgram1AsyncMetrics();
+
+    if (g_program1State == Program1State::Idle) {
+        return;
+    }
+
+    if (g_c2Active) {
+        return;
+    }
+
+    if (g_motion.active) {
+        return;
+    }
+
+    switch (g_program1State) {
+        case Program1State::StartBufferedPass1:
+            Serial.println("P1: буферный старт. Выполняем C, затем 3 + Z.");
+            if (!runProgram1ShiftStage(SHIFT_DIR_C_LEVEL, Program1MetricKind::ShiftC, 1, "C (сдвиг)")) {
+                Serial.println("P1: аварийная остановка на шаге C.");
+                g_program1State = Program1State::Idle;
+                return;
+            }
+            startProgram1Pos3(1);
+            if (!runProgram1ShiftStage(SHIFT_DIR_Z_LEVEL, Program1MetricKind::ShiftZ, 1, "Z (возврат)")) {
+                Serial.println("P1: аварийная остановка на шаге Z.");
+                g_program1State = Program1State::Idle;
+                return;
+            }
+            Serial.println("P1: шаг 2/3 -> команда 2.");
+            startProgram1Cycle2(2);
+            g_program1State = Program1State::WaitSecondC2Done;
+            return;
+
+        case Program1State::WaitFirstC2Done:
+            Serial.println("P1: 1-й проход 2 завершен. Выполняем C, затем 3 + Z.");
+            if (!runProgram1ShiftStage(SHIFT_DIR_C_LEVEL, Program1MetricKind::ShiftC, 1, "C (сдвиг)")) {
+                Serial.println("P1: аварийная остановка на шаге C.");
+                g_program1State = Program1State::Idle;
+                return;
+            }
+            startProgram1Pos3(1);
+            if (!runProgram1ShiftStage(SHIFT_DIR_Z_LEVEL, Program1MetricKind::ShiftZ, 1, "Z (возврат)")) {
+                Serial.println("P1: аварийная остановка на шаге Z.");
+                g_program1State = Program1State::Idle;
+                return;
+            }
+            Serial.println("P1: шаг 2/3 -> команда 2.");
+            startProgram1Cycle2(2);
+            g_program1State = Program1State::WaitSecondC2Done;
+            return;
+
+        case Program1State::WaitSecondC2Done:
+            Serial.println("P1: 2-й проход 2 завершен. Выполняем C, затем 3 + Z.");
+            if (!runProgram1ShiftStage(SHIFT_DIR_C_LEVEL, Program1MetricKind::ShiftC, 2, "C (сдвиг)")) {
+                Serial.println("P1: аварийная остановка на шаге C.");
+                g_program1State = Program1State::Idle;
+                return;
+            }
+            startProgram1Pos3(2);
+            if (!runProgram1ShiftStage(SHIFT_DIR_Z_LEVEL, Program1MetricKind::ShiftZ, 2, "Z (возврат)")) {
+                Serial.println("P1: аварийная остановка на шаге Z.");
+                g_program1State = Program1State::Idle;
+                return;
+            }
+            Serial.println("P1: шаг 3/3 -> команда 2.");
+            startProgram1Cycle2(3);
+            g_program1State = Program1State::WaitThirdC2Done;
+            return;
+
+        case Program1State::WaitThirdC2Done:
+            Serial.println("P1: 3-й проход 2 завершен. Финальный C + Z.");
+            if (!runProgram1ShiftStage(SHIFT_DIR_C_LEVEL, Program1MetricKind::ShiftC, 3, "C (сдвиг)")) {
+                Serial.println("P1: аварийная остановка на шаге C.");
+                g_program1State = Program1State::Idle;
+                return;
+            }
+            if (!runProgram1ShiftStage(SHIFT_DIR_Z_LEVEL, Program1MetricKind::ShiftZ, 3, "Z (возврат)")) {
+                Serial.println("P1: аварийная остановка на шаге Z.");
+                g_program1State = Program1State::Idle;
+                return;
+            }
+            if (g_program1ActivePosMetric >= 0 || g_posMotion.active) {
+                Serial.println("P1: ждем завершение последнего этапа 3 перед наполнением буфера.");
+                g_program1State = Program1State::WaitFinalPositionalDone;
+                return;
+            }
+            Serial.println("P1: запускаем дополнительный 2 для наполнения буфера.");
+            startProgram1Cycle2Metric(Program1MetricKind::BufferFill, 1);
+            if (!g_c2Active) {
+                Serial.println("P1: ошибка, не удалось запустить буферный 2.");
+                g_program1State = Program1State::Idle;
+                return;
+            }
+            g_program1State = Program1State::WaitBufferFillC2Done;
+            return;
+
+        case Program1State::WaitFinalPositionalDone:
+            if (g_program1ActivePosMetric >= 0 || g_posMotion.active) {
+                return;
+            }
+            Serial.println("P1: запускаем дополнительный 2 для наполнения буфера.");
+            startProgram1Cycle2Metric(Program1MetricKind::BufferFill, 1);
+            if (!g_c2Active) {
+                Serial.println("P1: ошибка, не удалось запустить буферный 2.");
+                g_program1State = Program1State::Idle;
+                return;
+            }
+            g_program1State = Program1State::WaitBufferFillC2Done;
+            return;
+
+        case Program1State::WaitBufferFillC2Done:
+            setProgram1BufferReady(true);
+            Serial.println("P1: программа 1 завершена.");
+            Serial.println("P1: буфер пополнен, в памяти отмечено: тарелки есть.");
+            printProgram1Summary();
+            g_program1State = Program1State::Idle;
+            return;
+
+        case Program1State::Idle:
+        default:
+            return;
+    }
 }
 
 void stopPositionalMotion()
@@ -738,28 +1703,31 @@ bool readSensorPlateRaw()
     return digitalRead(PIN_SENSOR) == HIGH;
 }
 
+bool readShiftSensorZRaw()
+{
+    return digitalRead(PIN_SHIFT_SENSOR_Z) == HIGH;
+}
+
+bool readShiftSensorCRaw()
+{
+    return digitalRead(PIN_SHIFT_SENSOR_C) == HIGH;
+}
+
 void updateSensorFilter()
 {
-    const uint32_t nowMs = millis();
-    const bool rawPlateDetected = readSensorPlateRaw();
+    updateDebouncedSensorFilter(g_sensorFilter, readSensorPlateRaw(), SENSOR_DEBOUNCE_MS);
+}
 
-    if (!g_sensorFilter.initialized) {
-        g_sensorFilter.initialized = true;
-        g_sensorFilter.lastRawPlateDetected = rawPlateDetected;
-        g_sensorFilter.stablePlateDetected = rawPlateDetected;
-        g_sensorFilter.lastRawChangeMs = nowMs;
-        return;
-    }
-
-    if (rawPlateDetected != g_sensorFilter.lastRawPlateDetected) {
-        g_sensorFilter.lastRawPlateDetected = rawPlateDetected;
-        g_sensorFilter.lastRawChangeMs = nowMs;
-    }
-
-    if (rawPlateDetected != g_sensorFilter.stablePlateDetected &&
-        (uint32_t)(nowMs - g_sensorFilter.lastRawChangeMs) >= SENSOR_DEBOUNCE_MS) {
-        g_sensorFilter.stablePlateDetected = rawPlateDetected;
-    }
+void updateShiftSensorFilters()
+{
+    updateDebouncedSensorFilter(
+        g_shiftSensorZFilter,
+        readShiftSensorZRaw(),
+        SHIFT_SENSOR_DEBOUNCE_MS);
+    updateDebouncedSensorFilter(
+        g_shiftSensorCFilter,
+        readShiftSensorCRaw(),
+        SHIFT_SENSOR_DEBOUNCE_MS);
 }
 
 bool isPlateAtSensorFiltered()
@@ -767,11 +1735,28 @@ bool isPlateAtSensorFiltered()
     return g_sensorFilter.stablePlateDetected;
 }
 
+bool isShiftSensorZTriggered()
+{
+    updateShiftSensorFilters();
+    return g_shiftSensorZFilter.stablePlateDetected;
+}
+
+bool isShiftSensorCTriggered()
+{
+    updateShiftSensorFilters();
+    return g_shiftSensorCFilter.stablePlateDetected;
+}
+
 void printSensorState()
 {
     const bool isPlateAtSensor = isPlateAtSensorFiltered();
     Serial.print("Датчик E18-D50NK: ");
     Serial.println(isPlateAtSensor ? "тарелка на флаге (HIGH)" : "тарелки нет (LOW)");
+
+    Serial.print("Геркон Z GPIO33: ");
+    Serial.println(isShiftSensorZTriggered() ? "замкнут (HIGH)" : "разомкнут (LOW)");
+    Serial.print("Геркон C GPIO25: ");
+    Serial.println(isShiftSensorCTriggered() ? "замкнут (HIGH)" : "разомкнут (LOW)");
 }
 
 void processSensorStream()
@@ -820,6 +1805,11 @@ void handleCommand(String line)
         }
         const uint32_t steps = distanceMm * PULSES_PER_MM;
         startConstantMotion(steps, MANUAL_MOVE_DELAY_US);
+        return;
+    }
+
+    if (cmd == "1") {
+        startProgram1();
         return;
     }
 
@@ -872,6 +1862,21 @@ void handleCommand(String line)
         return;
     }
 
+    if (cmd == "CZ") {
+        calibrateShiftTravel();
+        return;
+    }
+
+    if (cmd == "C") {
+        runShiftMove(SHIFT_DIR_C_LEVEL, "C (сдвиг)");
+        return;
+    }
+
+    if (cmd == "Z") {
+        runShiftMove(SHIFT_DIR_Z_LEVEL, "Z (возврат)");
+        return;
+    }
+
     if (WifiConsole::handleCommand(
             cmd, args, g_motion.active || g_c2Active)) {
         return;
@@ -889,13 +1894,11 @@ void readSerialCommands()
 {
     while (Serial.available() > 0) {
         const char ch = static_cast<char>(Serial.read());
-        if (ch == '\r') {
-            continue;
-        }
-
-        if (ch == '\n') {
-            handleCommand(g_cmdBuffer);
-            g_cmdBuffer = "";
+        if (ch == '\r' || ch == '\n') {
+            if (!g_cmdBuffer.isEmpty()) {
+                handleCommand(g_cmdBuffer);
+                g_cmdBuffer = "";
+            }
             continue;
         }
 
@@ -914,14 +1917,23 @@ void setup()
     delay(300);
 
     pinMode(PIN_STEP_PUL, OUTPUT);
+    pinMode(PIN_SHIFT_DIR, OUTPUT);
+    pinMode(PIN_SHIFT_PUL, OUTPUT);
+    pinMode(PIN_SHIFT_SENSOR_Z, INPUT_PULLDOWN);
+    pinMode(PIN_SHIFT_SENSOR_C, INPUT_PULLDOWN);
     pinMode(PIN_FLAG, OUTPUT);
     pinMode(PIN_SENSOR, INPUT_PULLUP);
     pinMode(PIN_POS_PUL, OUTPUT);
 
     writePulseInactive();
+    digitalWrite(PIN_SHIFT_DIR, SHIFT_DIR_C_LEVEL);
+    writeShiftPulseInactive();
     digitalWrite(PIN_FLAG, FLAG_DOWN_LEVEL);
     writePosPulseInactive();
+    initProgram1Storage();
     updateSensorFilter();
+    updateShiftSensorFilters();
+    homeShiftToZOnStartup();
     WifiConsole::begin();
     MqttLink::setCommandHandler(handleMqttCommand);
     MqttLink::begin();
@@ -933,8 +1945,11 @@ void setup()
     Serial.println("Плата: ESP32 Dev Module");
     Serial.println("DM542: PUL=13");
     Serial.println("DM542 positional: PUL=GPIO32");
-    Serial.println("Запущено два конвейера.");
-    Serial.println("GPIO 12/14/25/33 не используются.");
+    Serial.println("Запущено два конвейера + сдвиг тарелки.");
+    Serial.println("Сдвиг тарелки: DIR=GPIO14, PUL=GPIO12, Z=GPIO33, C=GPIO25.");
+    Serial.println("Сдвиг по умолчанию: фиксированный ход 2255 шагов.");
+    Serial.print("P1 buffer: ");
+    Serial.println(g_program1BufferReady ? "есть 2 тарелки." : "пусто.");
     Serial.println("Sensor: GPIO26 (E18-D50NK)");
     Serial.println("Флаг вверх: GPIO27=HIGH");
     Serial.println("WiFi: команды WSCAN/WIFI/WSTAT/WDIS.");
@@ -946,6 +1961,7 @@ void setup()
 void loop()
 {
     updateSensorFilter();
+    updateShiftSensorFilters();
     readSerialCommands();
 
     if (!g_posMotion.active) {
@@ -956,5 +1972,6 @@ void loop()
     processCycle2();
     processMotion();
     processPositionalMotion();
+    processProgram1();
     processSensorStream();
 }
