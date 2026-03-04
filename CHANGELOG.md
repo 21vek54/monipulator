@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.10
+
+- Confirmed that the main production workflow under command `1` operates correctly.
+- Consolidated the active two-plate cycle logic under command `2`.
+- Cleaned up legacy diagnostic noise and removed the temporary command `222`.
+
 ## v1.6
 
 - Added initial MQTT integration for the conveyor controller:
