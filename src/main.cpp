@@ -4,10 +4,13 @@
 #include "pins.h"
 #include "program1.h"
 #include "shift_control.h"
-#include "wifi_console.h"
-#include "mqtt_link.h"
 
 constexpr char FW_VERSION[] = "v1.11";
+#if defined(DEVICE_ROLE_CONVEYOR)
+constexpr char DEVICE_NAME[] = "Управление конвейерами";
+#else
+constexpr char DEVICE_NAME[] = "Conveyor controller";
+#endif
 
 constexpr bool FLAG_UP_LEVEL = HIGH;
 constexpr bool FLAG_DOWN_LEVEL = LOW;
@@ -18,6 +21,8 @@ constexpr uint32_t POS_RUN_DELAY_US = 1000;
 constexpr uint32_t SENSOR_PRINT_INTERVAL_MS = 500;
 constexpr uint32_t SENSOR_DEBOUNCE_MS = 80;
 constexpr uint32_t MANUAL_MOVE_DELAY_US = 1500; // Фиксированная задержка для команд A/D
+constexpr uint32_t RS485_BAUD = 115200;
+constexpr size_t RS485_CMD_MAX_LEN = 48;
 constexpr uint32_t MOTION_START_DELAY_MULT_NUM = 2;
 constexpr uint32_t MOTION_START_DELAY_MULT_DEN = 1;
 constexpr uint32_t MOTION_RAMP_STEPS_DEFAULT = 150;
@@ -82,6 +87,7 @@ enum class C2State : uint8_t {
 };
 
 String g_cmdBuffer;
+String g_rs485CmdBuffer;
 Preferences g_preferences;
 MotionState g_motion;
 PosMotionState g_posMotion;
@@ -114,10 +120,11 @@ void stopMotion();
 void startCycle2();
 void startPositionalProfiledMotion(uint32_t stepsTotal, uint32_t nominalDelayUs);
 void processPositionalMotion();
-void printIntegrationStatus();
 void updateSensorFilter();
 void initProgram1Storage();
 void setProgram1BufferReady(bool ready);
+void initRs485();
+void processRs485Commands();
 
 void printHelp()
 {
@@ -129,20 +136,12 @@ void printHelp()
     Serial.println("  W            - флаг вверх");
     Serial.println("  S            - флаг вниз");
     Serial.println("  E            - вкл/выкл поток датчиков (E18 + 2 геркона, каждые 0.5 сек)");
-    Serial.println("  IQ           - состояние внешних систем (WiFi + MQTT)");
     Serial.println("  P 300        - позиционный (PUL32): вправо 300 мм, профиль, полка 1000 мкс");
-    Serial.println("  C            - сдвиг тарелки: 500 шагов (DIR14/PUL12), задержка 500 мкс, S-профиль, длинное торможение");
-    Serial.println("  Z            - возврат тарелки: 500 шагов (DIR14/PUL12), задержка 300 мкс, плавный ход");
+    Serial.println("  C            - сдвиг тарелки: 500 шагов (DIR14/PUL23), задержка 500 мкс, S-профиль, длинное торможение");
+    Serial.println("  Z            - возврат тарелки: 500 шагов (DIR14/PUL23), задержка 300 мкс, плавный ход");
     Serial.println("  CZ           - калибровка хода сдвига по герконам Z=33 и C=25");
-    WifiConsole::printHelp();
+    Serial.println("  RS485        - удаленно: W/S, UP/DOWN, FLAG UP/FLAG DOWN");
     Serial.println("  H            - помощь");
-}
-
-void printIntegrationStatus()
-{
-    Serial.println("=== Integration status ===");
-    WifiConsole::printStatus();
-    MqttLink::printStatus();
 }
 
 bool parseUnsigned(const String &s, uint32_t &value)
@@ -1047,11 +1046,6 @@ bool tryHandleServiceCommand(const String &cmd)
         return true;
     }
 
-    if (cmd == "IQ") {
-        printIntegrationStatus();
-        return true;
-    }
-
     if (cmd == "H") {
         printHelp();
         return true;
@@ -1078,11 +1072,6 @@ void handleCommand(String line)
         return;
     }
 
-    if (WifiConsole::handleCommand(
-            cmd, args, g_motion.active || g_c2Active)) {
-        return;
-    }
-
     Serial.println("Unknown command. Use H for help.");
 }
 
@@ -1102,9 +1091,59 @@ void readSerialCommands()
     }
 }
 
-void handleMqttCommand(const String &line)
+bool tryHandleRs485FlagCommand(String line)
 {
-    handleCommand(line);
+    line.trim();
+    if (line.isEmpty()) {
+        return false;
+    }
+
+    line.toUpperCase();
+
+    if (line == "W" || line == "UP" || line == "FLAG UP") {
+        digitalWrite(PIN_FLAG, FLAG_UP_LEVEL);
+        Serial.println("RS485: Flag UP.");
+        return true;
+    }
+
+    if (line == "S" || line == "DOWN" || line == "FLAG DOWN") {
+        digitalWrite(PIN_FLAG, FLAG_DOWN_LEVEL);
+        Serial.println("RS485: Flag DOWN.");
+        return true;
+    }
+
+    return false;
+}
+
+void processRs485Commands()
+{
+    while (Serial2.available() > 0) {
+        const char ch = static_cast<char>(Serial2.read());
+        if (ch == '\r' || ch == '\n') {
+            if (!g_rs485CmdBuffer.isEmpty()) {
+                if (!tryHandleRs485FlagCommand(g_rs485CmdBuffer)) {
+                    Serial.print("RS485: unknown cmd '");
+                    Serial.print(g_rs485CmdBuffer);
+                    Serial.println("'. Allowed: W/S, UP/DOWN, FLAG UP/DOWN.");
+                }
+                g_rs485CmdBuffer = "";
+            }
+            continue;
+        }
+
+        g_rs485CmdBuffer += ch;
+        if (g_rs485CmdBuffer.length() > RS485_CMD_MAX_LEN) {
+            g_rs485CmdBuffer = "";
+            Serial.println("RS485: command too long, buffer cleared.");
+        }
+    }
+}
+
+void initRs485()
+{
+    pinMode(PIN_RS485_DE_RE, OUTPUT);
+    digitalWrite(PIN_RS485_DE_RE, LOW); // Режим приема (RE=0, DE=0)
+    Serial2.begin(RS485_BAUD, SERIAL_8N1, PIN_RS485_RX, PIN_RS485_TX);
 }
 
 void initHardwarePins()
@@ -1132,41 +1171,27 @@ void initRuntimeState()
     homeShiftToZOnStartup();
 }
 
-void initExternalServices()
-{
-    WifiConsole::begin();
-    MqttLink::setCommandHandler(handleMqttCommand);
-    MqttLink::begin();
-}
-
 void printStartupBanner()
 {
     Serial.println();
-    Serial.println("=== Управление подающим конвейером ===");
+    Serial.print("=== ");
+    Serial.print(DEVICE_NAME);
+    Serial.println(" ===");
     Serial.print("Версия прошивки: ");
     Serial.println(FW_VERSION);
     Serial.println("Плата: ESP32 Dev Module");
     Serial.println("DM542: PUL=13");
     Serial.println("DM542 positional: PUL=GPIO32");
     Serial.println("Запущено два конвейера + сдвиг тарелки.");
-    Serial.println("Сдвиг тарелки: DIR=GPIO14, PUL=GPIO12, Z=GPIO33, C=GPIO25.");
+    Serial.println("Сдвиг тарелки: DIR=GPIO14, PUL=GPIO23, Z=GPIO33, C=GPIO25.");
+    Serial.println("RS485: RX=GPIO16, TX=GPIO17, DE/RE=GPIO18, 115200 8N1.");
     Serial.println("Сдвиг по умолчанию: фиксированный ход 2255 шагов.");
     Serial.print("P1 buffer: ");
     Serial.println(g_program1BufferReady ? "есть 2 тарелки." : "пусто.");
     Serial.println("Sensor: GPIO26 (E18-D50NK)");
     Serial.println("Флаг вверх: GPIO27=HIGH");
-    Serial.println("WiFi: команды WSCAN/WIFI/WSTAT/WDIS.");
-    Serial.println("MQTT: публикация статуса в underwater_conveyor/status.");
     Serial.println("Команды не чувствительны к регистру.");
     printHelp();
-}
-
-void processExternalServices()
-{
-    if (!g_posMotion.active) {
-        WifiConsole::process();
-        MqttLink::process();
-    }
 }
 
 void setup()
@@ -1176,8 +1201,8 @@ void setup()
 
     initHardwarePins();
     initHardwareStates();
+    initRs485();
     initRuntimeState();
-    initExternalServices();
     printStartupBanner();
 }
 
@@ -1186,8 +1211,7 @@ void loop()
     updateSensorFilter();
     shiftUpdateSensorFilters();
     readSerialCommands();
-
-    processExternalServices();
+    processRs485Commands();
 
     processCycle2();
     processMotion();

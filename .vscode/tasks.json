@@ -1,0 +1,153 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "PIO: Upload Conveyor (COM3)",
+      "type": "shell",
+      "command": "pio",
+      "args": [
+        "run",
+        "-e",
+        "conveyor_control_com3",
+        "-t",
+        "upload"
+      ],
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "PIO: Upload Master (COM9)",
+      "type": "shell",
+      "command": "pio",
+      "args": [
+        "run",
+        "-e",
+        "master_control_com9",
+        "-t",
+        "upload"
+      ],
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "PIO: Monitor Conveyor (COM3)",
+      "type": "shell",
+      "command": "pio",
+      "args": [
+        "run",
+        "-e",
+        "conveyor_control_com3",
+        "-t",
+        "monitor"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "PIO: Monitor Master (COM9)",
+      "type": "shell",
+      "command": "pio",
+      "args": [
+        "run",
+        "-e",
+        "master_control_com9",
+        "-t",
+        "monitor"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "PIO: Upload RS485 Test Master (COM9)",
+      "type": "shell",
+      "command": "pio",
+      "args": [
+        "run",
+        "-e",
+        "rs485_test_master_com9",
+        "-t",
+        "upload"
+      ],
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "PIO: Upload RS485 Test Slave (COM3)",
+      "type": "shell",
+      "command": "pio",
+      "args": [
+        "run",
+        "-e",
+        "rs485_test_slave_com3",
+        "-t",
+        "upload"
+      ],
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "PIO: Monitor RS485 Test Master (COM9)",
+      "type": "shell",
+      "command": "pio",
+      "args": [
+        "run",
+        "-e",
+        "rs485_test_master_com9",
+        "-t",
+        "monitor"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "PIO: Monitor RS485 Test Slave (COM3)",
+      "type": "shell",
+      "command": "pio",
+      "args": [
+        "run",
+        "-e",
+        "rs485_test_slave_com3",
+        "-t",
+        "monitor"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    }
+  ]
+}
