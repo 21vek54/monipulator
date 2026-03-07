@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.11
+
+- Added RS485 connectivity and configured communication with the VFD.
+
 ## v1.10
 
 - Confirmed that the main production workflow under command `1` operates correctly.

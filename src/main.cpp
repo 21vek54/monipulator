@@ -7,7 +7,7 @@
 #include "wifi_console.h"
 #include "mqtt_link.h"
 
-constexpr char FW_VERSION[] = "v1.10";
+constexpr char FW_VERSION[] = "v1.11";
 
 constexpr bool FLAG_UP_LEVEL = HIGH;
 constexpr bool FLAG_DOWN_LEVEL = LOW;
