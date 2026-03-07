@@ -148,6 +148,43 @@
         "panel": "dedicated",
         "clear": true
       }
+    },
+    {
+      "label": "PIO: Upload Manipulator (COM4)",
+      "type": "shell",
+      "command": "pio",
+      "args": [
+        "run",
+        "-e",
+        "manipulator_com4",
+        "-t",
+        "upload"
+      ],
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "PIO: Monitor Manipulator (COM4)",
+      "type": "shell",
+      "command": "pio",
+      "args": [
+        "run",
+        "-e",
+        "manipulator_com4",
+        "-t",
+        "monitor"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
     }
   ]
 }
